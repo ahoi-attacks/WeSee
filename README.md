@@ -1,6 +1,6 @@
 # WeSee
 
-See [ahoi-attacks.github.io](ahoi-attacks.github.io).
+See [ahoi-attacks.github.io/wesee](ahoi-attacks.github.io/wesee).
 
 ## Overview
 
@@ -20,6 +20,10 @@ We performed our experiments on Ubuntu 23.10 as host. Every other version will w
 On Ubuntu 23.10 execute:
 
 `sudo apt-get install git libglib2.0-dev libfdt-dev libpixman-1-dev zlib1g-dev ninja-build gcc-9 make guestfish`
+
+add your user to the docker group and relogin or continue as root
+
+`sudo usermod -a -G docker $USER`
 
 ## Build
 
