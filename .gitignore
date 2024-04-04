@@ -1,0 +1,8 @@
+linux/guest
+linux/host
+workdir
+qemu
+ovmf
+qemu_artifacts
+source-commit.qemu
+source-commit.ovmf
