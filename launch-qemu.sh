@@ -3,7 +3,7 @@
 #
 # user changeable parameters
 #
-# Stolen from 
+# Stolen from https://github.com/AMDESE/AMDSEV/blob/snp-latest/launch-qemu.sh
 
 HDA="/home/amd/fedora-30.raw"
 MEM="2048"

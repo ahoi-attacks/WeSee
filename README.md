@@ -1,6 +1,6 @@
 # WeSee
 
-See [ahoi-attacks.github.io/wesee](ahoi-attacks.github.io/wesee).
+[Wesee Project Website](https://ahoi-attacks.github.io/wesee/)
 
 ## Overview
 
